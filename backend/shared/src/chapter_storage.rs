@@ -148,7 +148,9 @@ impl ChapterStorage {
     #[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
     pub fn enable_ram(&mut self, _size_mb: usize) -> Result<()> {
         self.ram_enabled = false;
-        Err(anyhow::anyhow!("RAM-backed storage is only supported on Linux"))
+        Err(anyhow::anyhow!(
+            "RAM-backed storage is only supported on Linux"
+        ))
     }
 
     /// Switch back to persistent disk storage.
@@ -325,7 +327,10 @@ impl ChapterStorage {
         };
 
         // Perform the deletion
-        tokio::fs::remove_file(file_path).await?;
+        tokio::fs::remove_file(&file_path).await?;
+
+        // Remove the .sdr directory that KOReader creates alongside files
+        let _ = tokio::fs::remove_dir_all(sdr_path(&file_path)).await;
 
         // Update cache only after successful removal
         if let Some(size) = file_size {
@@ -391,12 +396,17 @@ impl ChapterStorage {
             } => result,
         }?;
 
-        tokio::fs::write(&file, &self.convert_image_data_to_jpeg(&bytes)?).await?;
+        let jpeg_data =
+            tokio::task::spawn_blocking(move || Self::convert_image_data_to_jpeg(&bytes))
+                .await
+                .context("spawn_blocking panicked in JPEG conversion")??;
+
+        tokio::fs::write(&file, jpeg_data).await?;
 
         Ok(file)
     }
 
-    fn convert_image_data_to_jpeg(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn convert_image_data_to_jpeg(data: &[u8]) -> Result<Vec<u8>> {
         let (width, height, rgb_pixels) = {
             if let Some(data) = decode_image_fast(data) {
                 let image = data?;
@@ -640,8 +650,11 @@ impl ChapterStorage {
         );
 
         let cloned_path = chapter_to_evict.clone();
-        let _ = match tokio::fs::remove_file(chapter_to_evict).await {
-            Ok(_) => Ok(()),
+        let _ = match tokio::fs::remove_file(&chapter_to_evict).await {
+            Ok(_) => {
+                let _ = tokio::fs::remove_dir_all(sdr_path(&chapter_to_evict)).await;
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // Already deleted
             Err(e) => Err(anyhow!(
                 "Failed to delete file {}: {}",
@@ -720,6 +733,14 @@ impl ChapterStorage {
     }
 }
 
+fn sdr_path(file_path: &std::path::Path) -> std::path::PathBuf {
+    let parent = file_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let stem = file_path.file_stem().unwrap_or_default();
+    parent.join(format!("{}.sdr", stem.to_string_lossy()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,7 +776,7 @@ mod tests {
     fn image_is_transcoded_to_jpeg() {
         let storage = make_storage();
         let input = make_rgb_jpeg(200, 300);
-        let output = storage.convert_image_data_to_jpeg(&input).unwrap();
+        let output = ChapterStorage::convert_image_data_to_jpeg(&input).unwrap();
         let (w, h) = output_dimensions(&output);
         assert_eq!((w, h), (200, 300));
     }
